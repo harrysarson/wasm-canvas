@@ -1,0 +1,20 @@
+<html>
+  <head>
+    <meta content="text/html;charset=utf-8" http-equiv="Content-Type"/>
+    <style>
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas" height="150" width="150"></canvas>
+    <canvas id="canvas2" height="150" width="150"></canvas>
+    <script type="module">
+        import init from "./pkg/wasm_canvas.js";
+        init();
+    </script>
+  </body>
+</html>
