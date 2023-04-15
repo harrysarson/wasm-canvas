@@ -17,10 +17,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut metrics = wasm_canvas::Metrics::default();
 
-    for _ in 0..1000 {
-        eprint!(".");
+    for _ in 0..300 {
         el.tick(&mut picture, &mut metrics);
     }
+    eprintln!("{:?}", &metrics);
 
     Ok(())
 }

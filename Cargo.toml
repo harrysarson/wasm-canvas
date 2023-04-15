@@ -38,3 +38,6 @@ proptest-derive = "0.3.0"
 
 [profile.release]
 debug = true
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

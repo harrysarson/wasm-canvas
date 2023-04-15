@@ -4,8 +4,10 @@ use gloo_timers::future::TimeoutFuture;
 
 use std::cell::RefCell;
 
+use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::btree_map::Entry;
+// use std::collections::btree_map::Entry;
+use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -25,6 +27,12 @@ use proptest_derive::Arbitrary;
 pub struct Metrics {
     _null_swaps: usize,
     _swaps: usize,
+    add_new: usize,
+    add_old: usize,
+    remove_candidate_minimising: usize,
+    add_overwrites: usize,
+    lowest_cost_popped: usize,
+    popped_cost: f32,
 }
 
 #[derive(PartialEq, PartialOrd, Ord, Eq, Debug)]
@@ -63,24 +71,28 @@ pub struct Picture {
 impl Picture {
     pub fn new(data: Box<[u8]>, width: u32, height: u32) -> Self { Self { data, width, height } }
 
-    fn get_pix(&self, r: u32, c: u32) -> [u8; 3] {
-        let pix_idx = r * self.width + c;
-        let data_idx: usize = (pix_idx * 4).try_into().unwrap();
-        self.data[data_idx..][0..3].try_into().unwrap()
+    fn get_data_index(&self, c: Coordinate) -> usize {
+        let pix_idx = c.0 * self.width + c.1;
+        (pix_idx * 4).try_into().unwrap()
+    }
+
+    fn get_pix(&self, c: Coordinate) -> [u8; 3] {
+        self.data[self.get_data_index(c)..][0..3].try_into().unwrap()
     }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 struct Coordinate(u32, u32);
 
+type CostStore = [Vec<(Coordinate, [u8; 3])>; 256];
+
 struct Candidates {
     /// Maps pixels coordinate to its cost at time of insertion and color. Must be kept up to date.
-    color: BTreeMap<Coordinate, (u8, [u8; 3])>,
+    color: HashMap<Coordinate, (u8, [u8; 3])>,
 
     /// Maps pixels cost at time of insertion to its location
-    cost: [HashSet<Coordinate>; 256],
+    cost: CostStore,
 
-    scratch: Vec<u8>,
 }
 
 impl Candidates {
@@ -88,39 +100,48 @@ impl Candidates {
         return Self {
             color: Default::default(),
             cost: [(); 256].map(|_| Default::default()),
-            scratch: Default::default(),
         };
     }
 
-    fn add(&mut self, picture: &Picture, r: u32, c: u32) {
-        let color = picture.get_pix(r, c);
-        let coor = Coordinate(r, c);
-        let new_cost = get_cost(picture, color, r, c);
+    fn remove_cost(store: &mut CostStore, cost: u8, coor: &Coordinate) {
+        let cost_container = &mut store[cost as usize];
+        let index = cost_container.iter().position(|(c, _)| c == coor).expect("must be in cost");
+        cost_container.remove(index);
+    }
+
+    fn add(&mut self, picture: &Picture, coor: Coordinate) -> bool {
+        let color = picture.get_pix(coor);
+        let new_cost = get_cost(picture, color, coor);
 
         match self.color.entry(coor) {
             Entry::Vacant(v) => {
                 v.insert((new_cost, color));
 
-                assert!(self.cost[new_cost as usize].insert(coor));
+                self.cost[new_cost as usize].push((coor, color));
+
+                false
             }
             Entry::Occupied(mut o) => {
                 let (cost_at_time_of_insertion, color) = o.get_mut();
 
                 assert!(color == color);
-                assert!(self.cost[*cost_at_time_of_insertion as usize].remove(&coor));
 
-                assert!(self.cost[new_cost as usize].insert(coor));
+                Self::remove_cost(&mut self.cost, *cost_at_time_of_insertion, &coor);
+
+                self.cost[new_cost as usize].push((coor, *color));
                 *cost_at_time_of_insertion = new_cost;
+
+                true
             }
-        };
+        }
     }
 
-    fn pop_highest_cost(&mut self) -> Option<(Coordinate, [u8; 3])> {
+    fn pop_highest_cost(&mut self) -> Option<(u8, Coordinate, [u8; 3])> {
         let highest_cost = {
-            let mut highest_cost = 255;
+            let mut highest_cost = 255u8;
 
             loop {
-                if !self.cost[highest_cost].is_empty() {
+                if !self.cost[highest_cost as usize].is_empty() {
                     break Some(highest_cost);
                 }
                 if highest_cost == 0 {
@@ -131,11 +152,9 @@ impl Candidates {
         };
 
         highest_cost.map(|highest_cost| {
-            let coor = *self.cost[highest_cost]
-                .iter().next()
-                .expect("this is not empty");
-
-            assert!(self.cost[highest_cost].remove(&coor));
+            let coor = self.cost[highest_cost as usize]
+                .pop()
+                .expect("this is not empty").0;
 
             let color = self
                 .color
@@ -143,11 +162,11 @@ impl Candidates {
                 .expect("must be in map as we found cost")
                 .1;
 
-            (coor, color)
+            (highest_cost, coor, color)
         })
     }
 
-    fn pop_all_lowest_cost(&mut self) {
+    fn pop_all_lowest_cost(&mut self) -> usize {
         let lowest_cost = {
             let mut lowest_cost = 0;
 
@@ -163,13 +182,16 @@ impl Candidates {
         };
 
         lowest_cost.map(|lowest_cost| {
-            for coor in &self.cost[lowest_cost] {
+            let store = &mut self.cost[lowest_cost];
+            for (coor, _) in &*store {
                 self.color
                     .remove(coor)
                     .expect("must be in map as we found cost");
             }
-            self.cost[lowest_cost].clear();
-        });
+            let count = store.len();
+            store.clear();
+            count
+        }).unwrap_or(0)
     }
 
     fn len(&self) -> usize {
@@ -191,20 +213,23 @@ impl Candidates {
         mut check_count: usize,
         f: impl Fn([u8; 3], Coordinate) -> T,
     ) -> Option<Coordinate> {
-        self.scratch.reserve(self.color.len());
-        self.scratch.clear();
         let mut minimising_coor = None;
         let mut current_min = None;
 
-        'outer: for cost in (0..256).rev() {
-            for coor in &self.cost[cost] {
+        'outer: for i in 0..256 {
+        // let mut cost = 255;
+        // 'outer: loop {
+            let cost = 255 - i;
+            // if !self.cost[cost].is_empty() {
+            //     dbg!(self.cost[cost].len());
+            // }
+            for (coor, color) in &self.cost[cost] {
                 if check_count == 0 {
                     break 'outer;
                 }
                 check_count -= 1;
 
-                let (_cost, color) = self.color[coor];
-                let val = f(color, *coor);
+                let val = f(*color, *coor);
                 if current_min
                     .as_ref()
                     .map_or(true, |current_min| &val <= current_min)
@@ -217,50 +242,50 @@ impl Candidates {
 
         minimising_coor.map(|minimising_coor| {
             let (cost_at_time_of_insertion, _color) = self.color.remove(&minimising_coor).unwrap();
-            assert!(self.cost[cost_at_time_of_insertion as usize].remove(&minimising_coor));
+            Self::remove_cost(&mut self.cost, cost_at_time_of_insertion, &minimising_coor);
             minimising_coor
         })
     }
 }
 
-fn get_cost_squared(picture: &Picture, color: [u8; 3], r: u32, c: u32) -> f32 {
-    let square = |x| {
-        return x * x;
-    };
+fn get_cost_squared(picture: &Picture, color: [u8; 3], c: Coordinate) -> u32 {
+    // let square = |x| {
+    //     return x * x;
+    // };
 
-    let pix_dist = |(r2, c2)| -> u32 {
-        let color2 = picture.get_pix(r2, c2);
+    let pix_dist = |(c2)| -> u32 {
+        let color2 = picture.get_pix(c2);
 
         zip(color, color2)
-            .map(|(a, b)| square(a as i32 - b as i32) as u32)
-            .sum()
+            .map(|(a, b)| (a as i32 - b as i32).abs())
+            .sum::<i32>() as u32
     };
 
     let mut cost = 0;
     let mut n = 0;
 
-    if c + 1 < picture.width {
+    if c.1 + 1 < picture.width {
         n += 1;
-        cost += pix_dist((r, c + 1));
+        cost += pix_dist(Coordinate(c.0, c.1 + 1));
     }
-    if c > 0 {
+    if c.1 > 0 {
         n += 1;
-        cost += pix_dist((r, c - 1));
+        cost += pix_dist(Coordinate(c.0, c.1 - 1));
     }
-    if r > 0 {
+    if c.0 > 0 {
         n += 1;
-        cost += pix_dist((r - 1, c));
+        cost += pix_dist(Coordinate(c.0 - 1, c.1));
     }
-    if r + 1 < picture.height {
+    if c.0 + 1 < picture.height {
         n += 1;
-        cost += pix_dist((r + 1, c));
+        cost += pix_dist(Coordinate(c.0 + 1, c.1));
     }
     debug_assert!(n > 0, "cannot be next to all four edges");
-    (cost as f32 / (3 * n) as f32)
+    cost / (3 * n)
 }
 
-fn get_cost(picture: &Picture, color: [u8; 3], r: u32, c: u32) -> u8 {
-    let cost = get_cost_squared(picture, color, r, c).sqrt() as u32;
+fn get_cost(picture: &Picture, color: [u8; 3], c: Coordinate) -> u8 {
+    let cost = get_cost_squared(picture, color, c);
 
     cost.try_into()
         .unwrap_or_else(|e| panic!("{cost} Should fit in u8"))
@@ -387,12 +412,13 @@ pub struct EventLoop {
 
 impl EventLoop {
     pub fn tick(&mut self, picture: &mut Picture, metrics: &mut Metrics) {
-        let swap_pix = |picture: &mut Picture, (r1, c1), (r2, c2)| {
-            let n1 = r1 * picture.width + c1;
-            let n2 = r2 * picture.width + c2;
-            picture.data.swap(n1 as usize * 4, n2 as usize * 4);
-            picture.data.swap(n1 as usize * 4 + 1, n2 as usize * 4 + 1);
-            picture.data.swap(n1 as usize * 4 + 2, n2 as usize * 4 + 2);
+        let swap_pix = |picture: &mut Picture, c1, c2| {
+            let n1 = picture.get_data_index(c1);
+            let n2 = picture.get_data_index(c2);
+
+            for i in 0..3 {
+                picture.data.swap(n1 + i, n2 + i);
+            }
         };
 
         let step = |rng: &fastrand::Rng, picture: &Picture, r, c| -> (u32, u32) {
@@ -499,45 +525,61 @@ impl EventLoop {
             unreachable!();
         };
 
-
-        let (mut r_b, mut c_b) = (
-            self.rng.u32(0..picture.height),
-            self.rng.u32(0..picture.width),
+        let rand_coor = |picture: &Picture, rng: &fastrand::Rng| Coordinate(
+            rng.u32(0..picture.height),
+            rng.u32(0..picture.width),
         );
 
+
         for _ in 0..10000 {
-            self.candidates.pop_all_lowest_cost();
+
+            metrics.lowest_cost_popped += self.candidates.pop_all_lowest_cost();
 
             while self.candidates.len() < 1000 {
-                (r_b, c_b) = step(&self.rng, &picture, r_b, c_b);
+                let b = rand_coor(picture, &self.rng);
 
-                self.candidates.add(&picture, r_b, c_b);
+                // (c_b, c_b) = step(&self.rng, &picture, r_b, c_b);
+
+                metrics.add_overwrites += self.candidates.add(&picture, b) as usize;
+
+                metrics.add_new += 1;
             }
 
-            let (Coordinate(r1, c1), _color1) = self
+            let (popped_cost, c1, _color1) = self
                 .candidates
                 .pop_highest_cost()
                 .expect("coordinates full");
 
-            let _color1 = picture.get_pix(r1, c1);
-            let Coordinate(r2, c2) = self
-                .candidates
-                .remove_candidate_minimising(10, |candidate_color, candidate_coor| {
-                    get_cost_squared(&picture, candidate_color, r1, c1)
-                        + get_cost_squared(
-                            &picture,
-                            candidate_color,
-                            candidate_coor.0,
-                            candidate_coor.1,
-                        )
-                })
-                .expect("coordinates one less than full");
+            metrics.popped_cost *= 0.99;
+            metrics.popped_cost += 0.01 * (popped_cost as f32);
 
-            swap_pix(picture, (r1, c1), (r2, c2));
+            let c2 = if self.rng.u32(0..1000) == 0 {
+                rand_coor(picture, &self.rng)
+            } else {
+
+                let color1 = picture.get_pix(c1);
+                metrics.remove_candidate_minimising += 1;
+                self
+                    .candidates
+                    .remove_candidate_minimising(10, |candidate_color, candidate_coor| {
+                        get_cost_squared(&picture, candidate_color, c1)
+                            + get_cost_squared(
+                                &picture,
+                                color1,
+                                candidate_coor,
+                            )
+                    })
+                    .expect("coordinates one less than full")
+
+            };
+
+            swap_pix(picture, c1, c2);
 
             metrics._swaps += 1;
 
-            self.candidates.add(&picture, r2, c2);
+            metrics.add_overwrites += self.candidates.add(&picture, c2) as usize;
+
+            metrics.add_old += 1;
 
             // overlay_context.set_fill_style(&"blue".into());
             // overlay_context.fill_rect(c1.into(), r1.into(), 1.0, 1.0);
