@@ -1,8 +1,6 @@
 use std::io::Cursor;
 
 fn main() -> anyhow::Result<()> {
-    let mut el = wasm_canvas::EventLoop::new();
-
     let bytes = include_bytes!("../images/tree.jpg");
 
     let img = image::io::Reader::new(Cursor::new(bytes))
@@ -14,6 +12,8 @@ fn main() -> anyhow::Result<()> {
     let height = img.height();
 
     let mut picture = wasm_canvas::Picture::new(img.into_raw().into_boxed_slice(), width, height);
+
+    let mut el = wasm_canvas::EventLoop::new(&picture);
 
     let mut metrics = wasm_canvas::Metrics::default();
 
